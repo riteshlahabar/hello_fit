@@ -1,0 +1,504 @@
+import {
+  BadRequestException,
+  ConflictException,
+  Injectable,
+  Logger,
+  NotFoundException,
+} from '@nestjs/common';
+import { randomInt } from 'node:crypto';
+import { PrismaService } from '../../prisma/prisma.service';
+import type { Prisma } from '../../generated/prisma/client';
+import { SettingsService } from '../settings/settings.service';
+import { ErrorCode } from '../../common/errors/error-codes';
+import {
+  AvailabilityService,
+  startOfDay,
+} from '../availability/availability.service';
+import {
+  quote as computeQuote,
+  splitSessionValues,
+  type AddonLine,
+  type QuoteBreakup,
+} from './pricing.calculator';
+import type { CreateBookingDto, QuoteBookingDto } from './dto/booking.dto';
+
+@Injectable()
+export class BookingService {
+  private readonly logger = new Logger(BookingService.name);
+
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly settings: SettingsService,
+    private readonly availability: AvailabilityService,
+  ) {}
+
+  /**
+   * Price breakup shown before payment (spec 3.1 step 9). Pure read — creates
+   * nothing, holds nothing, so the customer can adjust add-ons freely.
+   */
+  async quote(
+    customerId: string,
+    dto: QuoteBookingDto,
+  ): Promise<QuoteBreakup & { sessionCount: number; currency: string }> {
+    const payment = this.settings.get('payment');
+    const { service, pkg, addons } = await this.loadPricingInputs(dto);
+
+    const sessionCount = pkg?.sessionCount ?? dto.sessionCount ?? 1;
+
+    // A package carries its own total, so its per-session price is derived
+    // rather than taken from the service base price.
+    const unitPrice = pkg
+      ? Number(pkg.price) / pkg.sessionCount
+      : Number(service.basePrice);
+
+    const breakup = computeQuote(
+      {
+        unitPrice,
+        sessionCount,
+        addons,
+        distanceKm: dto.distanceKm,
+        discount: dto.discount,
+        walletApplied: dto.walletApplied,
+      },
+      payment,
+    );
+
+    return { ...breakup, sessionCount, currency: 'INR' };
+  }
+
+  /**
+   * Creates the booking and its sessions in one transaction (spec 3.1 step
+   * 10). The slot is re-validated inside the transaction: the list the
+   * customer saw may be seconds old, and two customers can race for the last
+   * slot.
+   *
+   * The booking lands in PENDING_PAYMENT with holdExpiresAt set; the expiry
+   * job releases it if payment never arrives.
+   */
+  async create(customerId: string, dto: CreateBookingDto) {
+    const payment = this.settings.get('payment');
+    const { service, pkg, addons } = await this.loadPricingInputs(dto);
+
+    const address = await this.prisma.address.findFirst({
+      where: { id: dto.addressId, customerId, deletedAt: null },
+      select: { id: true },
+    });
+
+    if (!address) {
+      throw new NotFoundException({
+        code: ErrorCode.NOT_FOUND,
+        message: 'Address not found on your account',
+      });
+    }
+
+    const occurrences = this.buildOccurrences(dto, pkg, service.durationMin);
+
+    if (occurrences.length === 0) {
+      throw new BadRequestException({
+        code: ErrorCode.VALIDATION_FAILED,
+        message: 'No valid session dates were produced for this booking',
+      });
+    }
+
+    const sessionCount = occurrences.length;
+    const unitPrice = pkg
+      ? Number(pkg.price) / pkg.sessionCount
+      : Number(service.basePrice);
+
+    const breakup = computeQuote(
+      {
+        unitPrice,
+        sessionCount,
+        addons,
+        distanceKm: dto.distanceKm,
+        discount: dto.discount,
+        walletApplied: dto.walletApplied,
+      },
+      payment,
+    );
+
+    // Values that sum back exactly to the gross, so the earning rows can
+    // never total more than the customer paid.
+    const sessionValues = splitSessionValues(
+      breakup.grossAmount,
+      sessionCount,
+    );
+
+    // If the customer picked a specific teacher, confirm they are still free
+    // for every occurrence before taking any money.
+    if (dto.instructorId) {
+      for (const occurrence of occurrences) {
+        const free = await this.availability.isSlotStillFree({
+          instructorId: dto.instructorId,
+          date: occurrence.date,
+          fromMinute: occurrence.fromMinute,
+          toMinute: occurrence.toMinute,
+        });
+
+        if (!free) {
+          throw new ConflictException({
+            code: ErrorCode.DUPLICATE_RESOURCE,
+            message:
+              'That teacher is no longer available for one of the selected slots.',
+            details: {
+              date: occurrence.date.toISOString().slice(0, 10),
+              fromMinute: occurrence.fromMinute,
+            },
+          });
+        }
+      }
+    }
+
+    const holdExpiresAt = new Date(
+      Date.now() + payment.slotHoldMinutes * 60_000,
+    );
+
+    const booking = await this.prisma.$transaction(async (tx) => {
+      const created = await tx.booking.create({
+        data: {
+          code: await this.nextBookingCode(tx),
+          customerId,
+          serviceId: service.id,
+          packageId: pkg?.id,
+          addressId: address.id,
+          type: pkg ? 'PACKAGE' : 'SINGLE',
+          sessionCount,
+          grossAmount: breakup.grossAmount,
+          discount: breakup.discount,
+          travelCharge: breakup.travelCharge,
+          addonAmount: breakup.addonAmount,
+          tax: breakup.tax,
+          walletApplied: breakup.walletApplied,
+          payable: breakup.payable,
+          paymentStatus: 'UNPAID',
+          source: 'APP_CUSTOMER',
+          // Cast because Prisma's Json input type does not accept an open
+          // Record; the DTO has already validated this is a plain object.
+          preferences: (dto.preferences ?? undefined) as
+            | Prisma.InputJsonValue
+            | undefined,
+          holdExpiresAt,
+          sessions: {
+            create: occurrences.map((occurrence, index) => ({
+              sequence: index + 1,
+              serviceId: service.id,
+              sessionDate: occurrence.date,
+              fromMinute: occurrence.fromMinute,
+              toMinute: occurrence.toMinute,
+              durationMin: service.durationMin,
+              addressId: address.id,
+              instructorId: dto.instructorId,
+              status: 'PENDING_PAYMENT',
+              sessionValue: sessionValues[index],
+              // Generated now so the confirmation screen can show it; the
+              // teacher only sees it after assignment.
+              checkInOtp: randomInt(0, 10_000).toString().padStart(4, '0'),
+            })),
+          },
+        },
+      });
+
+      // Read back explicitly rather than relying on `include` through the
+      // nested create — the sessions are needed for the history rows below.
+      const sessions = await tx.bookingSession.findMany({
+        where: { bookingId: created.id },
+        orderBy: { sequence: 'asc' },
+      });
+
+      if (dto.addonIds?.length) {
+        await tx.bookingAddon.createMany({
+          data: addons.map((line) => ({
+            bookingId: created.id,
+            addonId: line.addonId,
+            quantity: line.quantity,
+            unitPrice: line.unitPrice,
+          })),
+        });
+      }
+
+      // Every transition is recorded — this is the trail support and finance
+      // work from (spec 3.2).
+      await tx.bookingStatusHistory.createMany({
+        data: sessions.map((session) => ({
+          bookingId: created.id,
+          sessionId: session.id,
+          toStatus: 'PENDING_PAYMENT' as const,
+          actorType: 'CUSTOMER' as const,
+          actorId: customerId,
+          reason: 'Booking created',
+        })),
+      });
+
+      return { ...created, sessions };
+    });
+
+    this.logger.log(
+      `Booking ${booking.code} created: ${sessionCount} session(s), payable ${breakup.payable}`,
+    );
+
+    return {
+      id: booking.id,
+      code: booking.code,
+      payable: booking.payable,
+      paymentStatus: booking.paymentStatus,
+      holdExpiresAt: booking.holdExpiresAt,
+      breakup,
+      sessions: booking.sessions.map((session) => ({
+        id: session.id,
+        sequence: session.sequence,
+        sessionDate: session.sessionDate,
+        fromMinute: session.fromMinute,
+        toMinute: session.toMinute,
+        status: session.status,
+        sessionValue: session.sessionValue,
+      })),
+    };
+  }
+
+  /** Customer's own bookings, newest first. */
+  async listForCustomer(
+    customerId: string,
+    filter: { status?: 'upcoming' | 'completed' | 'cancelled' },
+  ) {
+    const today = startOfDay(new Date());
+
+    const statusFilter = (() => {
+      switch (filter.status) {
+        case 'completed':
+          return { status: { in: ['COMPLETED' as const] } };
+        case 'cancelled':
+          return {
+            status: {
+              in: [
+                'CANCELLED_BY_CUSTOMER' as const,
+                'CANCELLED_BY_TEACHER' as const,
+                'CANCELLED_BY_ADMIN' as const,
+                'NO_SHOW_CUSTOMER' as const,
+                'NO_SHOW_TEACHER' as const,
+              ],
+            },
+          };
+        case 'upcoming':
+          return { sessionDate: { gte: today } };
+        default:
+          return {};
+      }
+    })();
+
+    return this.prisma.booking.findMany({
+      where: {
+        customerId,
+        deletedAt: null,
+        ...(filter.status ? { sessions: { some: statusFilter } } : {}),
+      },
+      orderBy: { createdAt: 'desc' },
+      select: {
+        id: true,
+        code: true,
+        type: true,
+        payable: true,
+        paymentStatus: true,
+        createdAt: true,
+        service: { select: { id: true, name: true, durationMin: true } },
+        sessions: {
+          orderBy: { sequence: 'asc' },
+          select: {
+            id: true,
+            sequence: true,
+            sessionDate: true,
+            fromMinute: true,
+            toMinute: true,
+            status: true,
+          },
+        },
+      },
+    });
+  }
+
+  /** Full detail for one booking, scoped to its owner. */
+  async getForCustomer(customerId: string, bookingId: string) {
+    const booking = await this.prisma.booking.findFirst({
+      where: { id: bookingId, customerId, deletedAt: null },
+      include: {
+        service: true,
+        address: true,
+        sessions: {
+          orderBy: { sequence: 'asc' },
+          include: {
+            instructor: {
+              select: {
+                id: true,
+                name: true,
+                photoUrl: true,
+                ratingAvg: true,
+                languages: true,
+              },
+            },
+          },
+        },
+        addons: { include: { addon: { select: { name: true } } } },
+      },
+    });
+
+    if (!booking) {
+      throw new NotFoundException({
+        code: ErrorCode.NOT_FOUND,
+        message: 'Booking not found',
+      });
+    }
+
+    return booking;
+  }
+
+  // -------------------------------------------------------------------------
+
+  private async loadPricingInputs(dto: QuoteBookingDto) {
+    const service = await this.prisma.service.findFirst({
+      where: { id: dto.serviceId, isActive: true, deletedAt: null },
+      select: { id: true, basePrice: true, durationMin: true },
+    });
+
+    if (!service) {
+      throw new NotFoundException({
+        code: ErrorCode.NOT_FOUND,
+        message: 'Service not found',
+      });
+    }
+
+    const pkg = dto.packageId
+      ? await this.prisma.package.findFirst({
+          where: {
+            id: dto.packageId,
+            serviceId: service.id,
+            isActive: true,
+            deletedAt: null,
+          },
+          select: {
+            id: true,
+            price: true,
+            sessionCount: true,
+            allowedWeekdays: true,
+            validityDays: true,
+          },
+        })
+      : null;
+
+    if (dto.packageId && !pkg) {
+      throw new NotFoundException({
+        code: ErrorCode.NOT_FOUND,
+        message: 'Package not found for this service',
+      });
+    }
+
+    const addons: AddonLine[] = [];
+
+    if (dto.addonIds?.length) {
+      const rows = await this.prisma.addon.findMany({
+        where: { id: { in: dto.addonIds }, isActive: true, deletedAt: null },
+        select: { id: true, price: true, applicableServiceIds: true },
+      });
+
+      if (rows.length !== dto.addonIds.length) {
+        throw new BadRequestException({
+          code: ErrorCode.VALIDATION_FAILED,
+          message: 'One or more add-ons are unavailable',
+        });
+      }
+
+      for (const row of rows) {
+        if (
+          row.applicableServiceIds.length > 0 &&
+          !row.applicableServiceIds.includes(service.id)
+        ) {
+          throw new BadRequestException({
+            code: ErrorCode.VALIDATION_FAILED,
+            message: 'An add-on does not apply to this service',
+          });
+        }
+
+        // Prices always come from the database, never from the request —
+        // otherwise the client could set its own price.
+        addons.push({
+          addonId: row.id,
+          quantity: 1,
+          unitPrice: Number(row.price),
+        });
+      }
+    }
+
+    return { service, pkg, addons };
+  }
+
+  /**
+   * Expands a package into dated occurrences on the chosen weekdays, or
+   * returns the single requested session.
+   */
+  private buildOccurrences(
+    dto: CreateBookingDto,
+    pkg: { sessionCount: number; allowedWeekdays: number[] } | null,
+    durationMin: number,
+  ): Array<{ date: Date; fromMinute: number; toMinute: number }> {
+    const toMinute = dto.toMinute ?? dto.fromMinute + durationMin;
+    const first = startOfDay(new Date(dto.sessionDate));
+
+    if (!pkg) {
+      return [{ date: first, fromMinute: dto.fromMinute, toMinute }];
+    }
+
+    const weekdays =
+      dto.weekdays && dto.weekdays.length > 0
+        ? dto.weekdays
+        : pkg.allowedWeekdays.length > 0
+          ? pkg.allowedWeekdays
+          : [first.getDay()];
+
+    // A package restricted to certain weekdays cannot be booked on others.
+    if (
+      pkg.allowedWeekdays.length > 0 &&
+      weekdays.some((day) => !pkg.allowedWeekdays.includes(day))
+    ) {
+      throw new BadRequestException({
+        code: ErrorCode.VALIDATION_FAILED,
+        message: 'This package is not available on one of the chosen weekdays',
+      });
+    }
+
+    const occurrences: Array<{
+      date: Date;
+      fromMinute: number;
+      toMinute: number;
+    }> = [];
+    const cursor = new Date(first);
+
+    // Walk forward day by day, taking matching weekdays until the package is
+    // filled. Bounded so a bad weekday list cannot loop forever.
+    for (
+      let guard = 0;
+      occurrences.length < pkg.sessionCount && guard < 400;
+      guard += 1
+    ) {
+      if (weekdays.includes(cursor.getDay())) {
+        occurrences.push({
+          date: startOfDay(cursor),
+          fromMinute: dto.fromMinute,
+          toMinute,
+        });
+      }
+      cursor.setDate(cursor.getDate() + 1);
+    }
+
+    return occurrences;
+  }
+
+  /**
+   * Sequential, human-quotable code (HF-000123). Derived from the row count
+   * inside the transaction; a collision would surface as a unique-constraint
+   * violation rather than a silently duplicated code.
+   */
+  private async nextBookingCode(
+    tx: Pick<PrismaService, 'booking'>,
+  ): Promise<string> {
+    const count = await tx.booking.count();
+    return `HF-${String(count + 1).padStart(6, '0')}`;
+  }
+}

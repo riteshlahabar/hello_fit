@@ -28,12 +28,22 @@ interface EnvelopeParts {
   message?: string;
 }
 
+/**
+ * A controller opts into the envelope by returning an object whose keys are a
+ * subset of { data, meta, message }. Requiring the whole shape to match —
+ * rather than just the presence of `data` — means an entity that happens to
+ * carry its own `data` field is still returned untouched.
+ */
+const ENVELOPE_KEYS = new Set(['data', 'meta', 'message']);
+
 function hasEnvelopeParts(value: unknown): value is EnvelopeParts {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false;
+  }
+
+  const keys = Object.keys(value);
   return (
-    typeof value === 'object' &&
-    value !== null &&
-    'data' in value &&
-    ('meta' in value || 'message' in value)
+    keys.includes('data') && keys.every((key) => ENVELOPE_KEYS.has(key))
   );
 }
 

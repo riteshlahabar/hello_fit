@@ -10,7 +10,12 @@ import { PermissionsGuard } from './common/guards/permissions.guard';
 import { RolesGuard } from './common/guards/roles.guard';
 import { RequestIdMiddleware } from './common/middleware/request-id.middleware';
 import { validateEnv } from './config/env.validation';
+import { ScheduleModule } from '@nestjs/schedule';
 import { AuthModule } from './modules/auth/auth.module';
+import { AvailabilityModule } from './modules/availability/availability.module';
+import { BookingModule } from './modules/booking/booking.module';
+import { CatalogModule } from './modules/catalog/catalog.module';
+import { SettingsModule } from './modules/settings/settings.module';
 import { PrismaModule } from './prisma/prisma.module';
 
 @Module({
@@ -23,8 +28,15 @@ import { PrismaModule } from './prisma/prisma.module';
     // Baseline limit; auth routes tighten it with @Throttle.
     ThrottlerModule.forRoot([{ ttl: 60_000, limit: 120 }]),
     JwtModule.register({}),
+    // Drives the unpaid-booking expiry cron; BullMQ replaces the per-booking
+    // timing later but this stays as the safety net.
+    ScheduleModule.forRoot(),
     PrismaModule,
+    SettingsModule,
     AuthModule,
+    CatalogModule,
+    AvailabilityModule,
+    BookingModule,
   ],
   controllers: [AppController],
   providers: [
