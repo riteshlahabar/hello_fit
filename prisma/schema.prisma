@@ -1,13 +1,1490 @@
-// This is your Prisma schema file,
-// learn more about it in the docs: https://pris.ly/d/prisma-schema
-
-// Get a free hosted Postgres database in seconds: `npx create-db`
+// HelloFit — data model.
+//
+// Conventions (spec section 7): UUID primary keys, created_at / updated_at /
+// deleted_at on every table, created_by on anything an admin can change.
+// Money is Decimal, never Float. Enums are Postgres enums so the database
+// rejects an invalid state rather than trusting the application.
+//
+// This file currently covers Phase 1 — identity, RBAC, documents, addresses
+// and the geography masters they depend on. Catalog, booking, session, review
+// and money tables (spec 7.2 to 7.6) arrive in Phase 2 onward.
 
 generator client {
   provider = "prisma-client"
-  output   = "../generated/prisma"
+  output   = "../src/generated/prisma"
 }
 
 datasource db {
   provider = "postgresql"
+}
+
+// ---------------------------------------------------------------------------
+// Enums
+// ---------------------------------------------------------------------------
+
+enum UserRole {
+  CUSTOMER
+  INSTRUCTOR
+}
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  DELETED
+}
+
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+  UNDISCLOSED
+}
+
+/// Advisory band other teachers see instead of the raw trust score or the
+/// confidential review text (spec 4.3).
+enum TrustBand {
+  NEW
+  GOOD
+  CAUTION
+  RESTRICTED
+}
+
+enum InstructorStatus {
+  ACTIVE
+  SUSPENDED
+  BLACKLISTED
+}
+
+enum KycStatus {
+  NOT_SUBMITTED
+  PENDING
+  VERIFIED
+  REJECTED
+}
+
+/// Teacher onboarding pipeline (spec 3.6).
+enum OnboardingStage {
+  APPLIED
+  DOCUMENTS_SUBMITTED
+  SCREENING_CALL
+  DEMO_SESSION
+  APPROVED
+  REJECTED
+}
+
+enum DutyStatus {
+  ON_DUTY
+  OFF_DUTY
+}
+
+enum DocumentOwnerType {
+  INSTRUCTOR
+  CUSTOMER
+  ADMIN_USER
+}
+
+enum DocumentType {
+  ID_PROOF
+  ADDRESS_PROOF
+  PAN
+  BANK_DETAILS
+  YOGA_CERTIFICATION
+  POLICE_VERIFICATION
+  PHOTO
+  OTHER
+}
+
+enum VerifyStatus {
+  PENDING
+  VERIFIED
+  REJECTED
+  EXPIRED
+}
+
+enum OtpPurpose {
+  LOGIN
+  MOBILE_CHANGE
+  SESSION_CHECK_IN
+}
+
+enum DevicePlatform {
+  ANDROID
+  IOS
+  WEB
+}
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+/// One account per human. `roles` is an array because a person can be both a
+/// customer and a teacher — that is what drives the "Continue as" chooser in
+/// the app (spec 6.1). App users authenticate by mobile OTP and carry no
+/// password; admin logins live in AdminUser instead.
+model User {
+  id            String     @id @default(uuid()) @db.Uuid
+  mobile        String     @unique @db.VarChar(20)
+  email         String?    @unique @db.VarChar(255)
+  roles         UserRole[]
+  status        UserStatus @default(ACTIVE)
+  language      String     @default("en") @db.VarChar(10)
+  lastLoginAt   DateTime?  @map("last_login_at")
+  suspendedAt   DateTime?  @map("suspended_at")
+  suspendReason String?    @map("suspend_reason") @db.Text
+
+  customerProfile   CustomerProfile?
+  instructorProfile InstructorProfile?
+  devices           Device[]
+  otpRequests       OtpRequest[]
+  refreshTokens     RefreshToken[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([status])
+  @@index([deletedAt])
+  @@map("users")
+}
+
+model CustomerProfile {
+  id           String    @id @default(uuid()) @db.Uuid
+  userId       String    @unique @map("user_id") @db.Uuid
+  name         String    @db.VarChar(120)
+  gender       Gender    @default(UNDISCLOSED)
+  dob          DateTime? @db.Date
+  goal         String?   @db.VarChar(255)
+  /// Conditions, injuries and preferences the teacher must read before arriving.
+  healthNotes  String?   @map("health_notes") @db.Text
+  /// Derived from teacher-to-customer reviews and behaviour flags (spec 4.6).
+  trustScore   Decimal   @default(0) @map("trust_score") @db.Decimal(5, 2)
+  trustBand    TrustBand @default(NEW) @map("trust_band")
+  referralCode String    @unique @map("referral_code") @db.VarChar(20)
+  referredById String?   @map("referred_by_id") @db.Uuid
+  isBlocked    Boolean   @default(false) @map("is_blocked")
+  blockReason  String?   @map("block_reason") @db.Text
+
+  user       User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  referredBy CustomerProfile?  @relation("Referral", fields: [referredById], references: [id], onDelete: SetNull)
+  referrals  CustomerProfile[] @relation("Referral")
+  addresses  Address[]
+
+  createdAt     DateTime       @default(now()) @map("created_at")
+  updatedAt     DateTime       @updatedAt @map("updated_at")
+  deletedAt     DateTime?      @map("deleted_at")
+  bookings      Booking[]
+  walletAccount WalletAccount?
+
+  @@index([trustBand])
+  @@index([isBlocked])
+  @@map("customer_profiles")
+}
+
+model InstructorProfile {
+  id               String           @id @default(uuid()) @db.Uuid
+  userId           String           @unique @map("user_id") @db.Uuid
+  name             String           @db.VarChar(120)
+  gender           Gender           @default(UNDISCLOSED)
+  dob              DateTime?        @db.Date
+  bio              String?          @db.Text
+  experienceYears  Int              @default(0) @map("experience_years")
+  languages        String[]
+  specialisations  String[]
+  photoUrl         String?          @map("photo_url") @db.Text
+  /// Home base the travel radius and distance score are measured from.
+  homeBaseLat      Decimal?         @map("home_base_lat") @db.Decimal(10, 7)
+  homeBaseLng      Decimal?         @map("home_base_lng") @db.Decimal(10, 7)
+  travelRadiusKm   Int              @default(10) @map("travel_radius_km")
+  branchId         String?          @map("branch_id") @db.Uuid
+  dailySessionCap  Int              @default(4) @map("daily_session_cap")
+  /// Minutes blocked either side of a session so travel never double-books.
+  travelBufferMin  Int              @default(30) @map("travel_buffer_min")
+  kycStatus        KycStatus        @default(NOT_SUBMITTED) @map("kyc_status")
+  onboardingStage  OnboardingStage  @default(APPLIED) @map("onboarding_stage")
+  ratingAvg        Decimal          @default(0) @map("rating_avg") @db.Decimal(3, 2)
+  ratingCount      Int              @default(0) @map("rating_count")
+  /// Acceptance, punctuality, cancellations and no-shows (spec 4.6).
+  reliabilityScore Decimal          @default(0) @map("reliability_score") @db.Decimal(5, 2)
+  dutyStatus       DutyStatus       @default(OFF_DUTY) @map("duty_status")
+  status           InstructorStatus @default(ACTIVE)
+  statusReason     String?          @map("status_reason") @db.Text
+  codeOfConductAt  DateTime?        @map("code_of_conduct_accepted_at")
+  joinedAt         DateTime?        @map("joined_at")
+
+  user   User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+  branch Branch? @relation(fields: [branchId], references: [id], onDelete: SetNull)
+
+  createdAt              DateTime                @default(now()) @map("created_at")
+  updatedAt              DateTime                @updatedAt @map("updated_at")
+  deletedAt              DateTime?               @map("deleted_at")
+  instructorServices     InstructorService[]
+  instructorServiceAreas InstructorServiceArea[]
+  availabilityRules      AvailabilityRule[]
+  availabilityOverrides  AvailabilityOverride[]
+  leaves                 Leave[]
+  bookingSessions        BookingSession[]
+  assignments            Assignment[]
+  checkIns               CheckIn[]
+  commissionRules        CommissionRule[]
+  earnings               Earning[]
+  payouts                Payout[]
+
+  @@index([status, kycStatus])
+  @@index([onboardingStage])
+  @@index([dutyStatus])
+  @@index([branchId])
+  @@map("instructor_profiles")
+}
+
+/// KYC and certification files. Polymorphic by (ownerType, ownerId) because
+/// teachers, customers and admin users all carry documents; `fileUrl` is an
+/// object key in the private bucket, never a public URL (spec 10.1).
+model Document {
+  id           String            @id @default(uuid()) @db.Uuid
+  ownerType    DocumentOwnerType @map("owner_type")
+  ownerId      String            @map("owner_id") @db.Uuid
+  docType      DocumentType      @map("doc_type")
+  number       String?           @db.VarChar(100)
+  fileUrl      String            @map("file_url") @db.Text
+  issueDate    DateTime?         @map("issue_date") @db.Date
+  expiryDate   DateTime?         @map("expiry_date") @db.Date
+  verifyStatus VerifyStatus      @default(PENDING) @map("verify_status")
+  verifiedById String?           @map("verified_by_id") @db.Uuid
+  verifiedAt   DateTime?         @map("verified_at")
+  remarks      String?           @db.Text
+
+  verifiedBy AdminUser? @relation(fields: [verifiedById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([ownerType, ownerId])
+  @@index([verifyStatus])
+  // Drives the document-expiry reminder job (spec 8.1).
+  @@index([expiryDate])
+  @@map("documents")
+}
+
+/// Customer home addresses. Resolved to a service area at save time so slot
+/// search and teacher matching never geocode on the request path.
+model Address {
+  id          String   @id @default(uuid()) @db.Uuid
+  customerId  String   @map("customer_id") @db.Uuid
+  label       String   @db.VarChar(60)
+  line1       String   @db.VarChar(255)
+  line2       String?  @db.VarChar(255)
+  landmark    String?  @db.VarChar(255)
+  cityId      String?  @map("city_id") @db.Uuid
+  areaId      String?  @map("area_id") @db.Uuid
+  pincode     String   @db.VarChar(10)
+  lat         Decimal? @db.Decimal(10, 7)
+  lng         Decimal? @db.Decimal(10, 7)
+  isDefault   Boolean  @default(false) @map("is_default")
+  /// Gate code, lift, parking, "ring twice" — shown to the teacher en route.
+  accessNotes String?  @map("access_notes") @db.Text
+
+  customer CustomerProfile @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  city     City?           @relation(fields: [cityId], references: [id], onDelete: SetNull)
+  area     ServiceArea?    @relation(fields: [areaId], references: [id], onDelete: SetNull)
+
+  createdAt       DateTime         @default(now()) @map("created_at")
+  updatedAt       DateTime         @updatedAt @map("updated_at")
+  deletedAt       DateTime?        @map("deleted_at")
+  bookings        Booking[]
+  bookingSessions BookingSession[]
+
+  @@index([customerId])
+  @@index([areaId])
+  @@index([pincode])
+  @@map("addresses")
+}
+
+// ---------------------------------------------------------------------------
+// Auth support — OTP, devices, refresh tokens
+// ---------------------------------------------------------------------------
+
+/// OTP issue and verification attempts. The code is stored hashed so a
+/// database leak cannot be replayed, and `attempts` backs the lockout required
+/// by spec 10.1.
+model OtpRequest {
+  id         String     @id @default(uuid()) @db.Uuid
+  mobile     String     @db.VarChar(20)
+  userId     String?    @map("user_id") @db.Uuid
+  purpose    OtpPurpose @default(LOGIN)
+  codeHash   String     @map("code_hash") @db.VarChar(255)
+  expiresAt  DateTime   @map("expires_at")
+  attempts   Int        @default(0)
+  consumedAt DateTime?  @map("consumed_at")
+  requestIp  String?    @map("request_ip") @db.VarChar(64)
+
+  user User? @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([mobile, purpose])
+  @@index([expiresAt])
+  @@map("otp_requests")
+}
+
+/// Registered devices and their FCM tokens. Kept as rows rather than an array
+/// on User so a single device can be revoked and push failures traced per
+/// device.
+model Device {
+  id         String         @id @default(uuid()) @db.Uuid
+  userId     String         @map("user_id") @db.Uuid
+  platform   DevicePlatform
+  deviceId   String         @map("device_id") @db.VarChar(255)
+  fcmToken   String?        @map("fcm_token") @db.Text
+  appVersion String?        @map("app_version") @db.VarChar(40)
+  lastSeenAt DateTime?      @map("last_seen_at")
+  revokedAt  DateTime?      @map("revoked_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([userId, deviceId])
+  @@index([fcmToken])
+  @@map("devices")
+}
+
+/// Rotating refresh tokens (spec 10.1). Stored hashed; rotation marks the old
+/// row `replacedById` so a replayed token reveals a stolen session and the
+/// whole chain can be revoked.
+///
+/// Exactly one of `userId` (app login) or `adminUserId` (admin login) is set.
+/// Two nullable foreign keys rather than one polymorphic column, so the
+/// database still enforces that the subject exists and cascades on delete.
+model RefreshToken {
+  id           String    @id @default(uuid()) @db.Uuid
+  userId       String?   @map("user_id") @db.Uuid
+  adminUserId  String?   @map("admin_user_id") @db.Uuid
+  tokenHash    String    @unique @map("token_hash") @db.VarChar(255)
+  deviceId     String?   @map("device_id") @db.VarChar(255)
+  expiresAt    DateTime  @map("expires_at")
+  revokedAt    DateTime? @map("revoked_at")
+  replacedById String?   @map("replaced_by_id") @db.Uuid
+
+  user      User?      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  adminUser AdminUser? @relation(fields: [adminUserId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@index([adminUserId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+// ---------------------------------------------------------------------------
+// Admin, RBAC and audit
+// ---------------------------------------------------------------------------
+
+/// Admin panel logins. Separate from User because these authenticate by
+/// password + optional 2FA and are scoped to a branch, while app users
+/// authenticate by OTP.
+model AdminUser {
+  id               String     @id @default(uuid()) @db.Uuid
+  email            String     @unique @db.VarChar(255)
+  mobile           String?    @db.VarChar(20)
+  name             String     @db.VarChar(120)
+  passwordHash     String     @map("password_hash") @db.VarChar(255)
+  roleId           String     @map("role_id") @db.Uuid
+  /// Null means all branches — Super Admin and head-office staff.
+  branchId         String?    @map("branch_id") @db.Uuid
+  status           UserStatus @default(ACTIVE)
+  twoFactorSecret  String?    @map("two_factor_secret") @db.VarChar(255)
+  twoFactorEnabled Boolean    @default(false) @map("two_factor_enabled")
+  lastLoginAt      DateTime?  @map("last_login_at")
+  createdById      String?    @map("created_by_id") @db.Uuid
+
+  role              Role           @relation(fields: [roleId], references: [id])
+  branch            Branch?        @relation("BranchStaff", fields: [branchId], references: [id], onDelete: SetNull)
+  createdBy         AdminUser?     @relation("AdminCreatedBy", fields: [createdById], references: [id], onDelete: SetNull)
+  createdAdmins     AdminUser[]    @relation("AdminCreatedBy")
+  verifiedDocuments Document[]
+  auditLogs         AuditLog[]
+  managedBranches   Branch[]       @relation("BranchManager")
+  refreshTokens     RefreshToken[]
+
+  createdAt   DateTime     @default(now()) @map("created_at")
+  updatedAt   DateTime     @updatedAt @map("updated_at")
+  deletedAt   DateTime?    @map("deleted_at")
+  leaves      Leave[]
+  assignments Assignment[]
+  refunds     Refund[]
+  payouts     Payout[]
+
+  @@index([roleId])
+  @@index([branchId])
+  @@map("admin_users")
+}
+
+/// Super Admin, Operations Manager, Teacher Manager, Accounts, Support Agent,
+/// Content Editor (spec 1.2 and 5.8). `isSystem` protects the built-in roles
+/// from deletion.
+model Role {
+  id          String  @id @default(uuid()) @db.Uuid
+  name        String  @unique @db.VarChar(80)
+  slug        String  @unique @db.VarChar(80)
+  description String? @db.Text
+  isSystem    Boolean @default(false) @map("is_system")
+
+  adminUsers      AdminUser[]
+  rolePermissions RolePermission[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@map("roles")
+}
+
+/// One row per (module, action) pair — the admin sidebar group is the module,
+/// the action is view / create / edit / delete / approve / export.
+model Permission {
+  id          String  @id @default(uuid()) @db.Uuid
+  module      String  @db.VarChar(80)
+  action      String  @db.VarChar(40)
+  description String? @db.Text
+
+  rolePermissions RolePermission[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([module, action])
+  @@index([module])
+  @@map("permissions")
+}
+
+model RolePermission {
+  id           String @id @default(uuid()) @db.Uuid
+  roleId       String @map("role_id") @db.Uuid
+  permissionId String @map("permission_id") @db.Uuid
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@unique([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+/// Every admin action with before and after values (spec 10.1). Append-only:
+/// no updatedAt, and nothing in the application may delete a row.
+model AuditLog {
+  id          String  @id @default(uuid()) @db.Uuid
+  adminUserId String? @map("admin_user_id") @db.Uuid
+  action      String  @db.VarChar(80)
+  entityType  String  @map("entity_type") @db.VarChar(80)
+  entityId    String? @map("entity_id") @db.VarChar(80)
+  before      Json?
+  after       Json?
+  reason      String? @db.Text
+  ipAddress   String? @map("ip_address") @db.VarChar(64)
+  requestId   String? @map("request_id") @db.VarChar(80)
+
+  adminUser AdminUser? @relation(fields: [adminUserId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([entityType, entityId])
+  @@index([adminUserId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
+
+// ---------------------------------------------------------------------------
+// Geography masters (spec 7.2) — Phase 1 needs these as address and branch
+// foreign keys; the catalog tables that sit beside them come in Phase 2.
+// ---------------------------------------------------------------------------
+
+model City {
+  id         String    @id @default(uuid()) @db.Uuid
+  name       String    @db.VarChar(120)
+  state      String?   @db.VarChar(120)
+  isActive   Boolean   @default(true) @map("is_active")
+  launchDate DateTime? @map("launch_date") @db.Date
+
+  serviceAreas ServiceArea[]
+  branches     Branch[]
+  addresses    Address[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+  holidays  Holiday[]
+
+  @@unique([name, state])
+  @@index([isActive])
+  @@map("cities")
+}
+
+/// A serviceable zone inside a city. An address with no matching active area
+/// is what triggers the app's "coming soon — notify me" state (spec 3.1).
+model ServiceArea {
+  id         String    @id @default(uuid()) @db.Uuid
+  cityId     String    @map("city_id") @db.Uuid
+  name       String    @db.VarChar(120)
+  branchId   String?   @map("branch_id") @db.Uuid
+  isActive   Boolean   @default(true) @map("is_active")
+  launchDate DateTime? @map("launch_date") @db.Date
+
+  city      City      @relation(fields: [cityId], references: [id], onDelete: Restrict)
+  branch    Branch?   @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  pincodes  Pincode[]
+  addresses Address[]
+
+  createdAt              DateTime                @default(now()) @map("created_at")
+  updatedAt              DateTime                @updatedAt @map("updated_at")
+  deletedAt              DateTime?               @map("deleted_at")
+  instructorServiceAreas InstructorServiceArea[]
+
+  @@unique([cityId, name])
+  @@index([isActive])
+  @@map("service_areas")
+}
+
+model Pincode {
+  id       String  @id @default(uuid()) @db.Uuid
+  code     String  @db.VarChar(10)
+  areaId   String  @map("area_id") @db.Uuid
+  isActive Boolean @default(true) @map("is_active")
+
+  area ServiceArea @relation(fields: [areaId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([code, areaId])
+  @@index([code])
+  @@map("pincodes")
+}
+
+model Branch {
+  id        String  @id @default(uuid()) @db.Uuid
+  name      String  @db.VarChar(120)
+  cityId    String  @map("city_id") @db.Uuid
+  address   String? @db.Text
+  managerId String? @map("manager_id") @db.Uuid
+  isActive  Boolean @default(true) @map("is_active")
+
+  city         City                @relation(fields: [cityId], references: [id], onDelete: Restrict)
+  manager      AdminUser?          @relation("BranchManager", fields: [managerId], references: [id], onDelete: SetNull)
+  staff        AdminUser[]         @relation("BranchStaff")
+  serviceAreas ServiceArea[]
+  instructors  InstructorProfile[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([cityId, name])
+  @@map("branches")
+}
+
+/// Languages offered across app, SMS and email templates (spec 10.3).
+model Language {
+  id        String  @id @default(uuid()) @db.Uuid
+  code      String  @unique @db.VarChar(10)
+  name      String  @db.VarChar(80)
+  isActive  Boolean @default(true) @map("is_active")
+  isDefault Boolean @default(false) @map("is_default")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@map("languages")
+}
+
+// ===========================================================================
+// PHASE 2 — catalog, scheduling, bookings, sessions, assignments (spec 7.2, 7.3)
+// ===========================================================================
+
+enum ServiceLevel {
+  BEGINNER
+  INTERMEDIATE
+  ADVANCED
+  ALL_LEVELS
+}
+
+enum BookingType {
+  SINGLE
+  PACKAGE
+  MEMBERSHIP
+}
+
+enum PaymentStatus {
+  UNPAID
+  PENDING
+  PAID
+  PARTIALLY_REFUNDED
+  REFUNDED
+  FAILED
+}
+
+enum BookingSource {
+  APP_CUSTOMER
+  ADMIN
+  WEBSITE
+}
+
+/// Session lifecycle (spec 3.2). Every transition is recorded in
+/// BookingStatusHistory with the actor and reason.
+enum SessionStatus {
+  PENDING_PAYMENT
+  CONFIRMED
+  ASSIGNED
+  REASSIGNMENT_NEEDED
+  EN_ROUTE
+  IN_PROGRESS
+  COMPLETED
+  RESCHEDULE_REQUESTED
+  CANCELLED_BY_CUSTOMER
+  CANCELLED_BY_TEACHER
+  CANCELLED_BY_ADMIN
+  NO_SHOW_CUSTOMER
+  NO_SHOW_TEACHER
+}
+
+enum AssignmentMode {
+  AUTO
+  MANUAL
+  DIRECT
+}
+
+enum AssignmentResponse {
+  PENDING
+  ACCEPTED
+  DECLINED
+  EXPIRED
+  CANCELLED
+}
+
+enum LeaveStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+enum RescheduleStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+enum ActorType {
+  CUSTOMER
+  INSTRUCTOR
+  ADMIN
+  SYSTEM
+}
+
+// ---------------------------------------------------------------------------
+// Catalog
+// ---------------------------------------------------------------------------
+
+model ServiceCategory {
+  id          String  @id @default(uuid()) @db.Uuid
+  name        String  @db.VarChar(120)
+  slug        String  @unique @db.VarChar(120)
+  icon        String? @db.VarChar(120)
+  imageUrl    String? @map("image_url") @db.Text
+  description String? @db.Text
+  sortOrder   Int     @default(0) @map("sort_order")
+  isActive    Boolean @default(true) @map("is_active")
+
+  services Service[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([isActive, sortOrder])
+  @@map("service_categories")
+}
+
+model Service {
+  id              String       @id @default(uuid()) @db.Uuid
+  categoryId      String       @map("category_id") @db.Uuid
+  name            String       @db.VarChar(160)
+  slug            String       @unique @db.VarChar(160)
+  durationMin     Int          @map("duration_min")
+  basePrice       Decimal      @map("base_price") @db.Decimal(10, 2)
+  level           ServiceLevel @default(ALL_LEVELS)
+  maxParticipants Int          @default(1) @map("max_participants")
+  equipment       String?      @db.Text
+  description     String?      @db.Text
+  inclusions      String?      @db.Text
+  /// Shown to the customer before the session and in the confirmation.
+  instructions    String?      @db.Text
+  isHomeService   Boolean      @default(true) @map("is_home_service")
+  /// Whether the customer may extend the to-time beyond durationMin.
+  allowExtension  Boolean      @default(false) @map("allow_extension")
+  isActive        Boolean      @default(true) @map("is_active")
+
+  category           ServiceCategory     @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  instructorServices InstructorService[]
+  packages           Package[]
+  bookings           Booking[]
+  sessions           BookingSession[]
+  commissionRules    CommissionRule[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([categoryId, isActive])
+  @@map("services")
+}
+
+/// The rate card and skill map: which teacher offers which service, and at
+/// what price if it differs from the service base price (spec 7.2).
+model InstructorService {
+  id           String       @id @default(uuid()) @db.Uuid
+  instructorId String       @map("instructor_id") @db.Uuid
+  serviceId    String       @map("service_id") @db.Uuid
+  level        ServiceLevel @default(ALL_LEVELS)
+  customPrice  Decimal?     @map("custom_price") @db.Decimal(10, 2)
+  isActive     Boolean      @default(true) @map("is_active")
+  /// Teacher-requested changes wait for Teacher Manager approval (spec 6.3).
+  approvedAt   DateTime?    @map("approved_at")
+
+  instructor InstructorProfile @relation(fields: [instructorId], references: [id], onDelete: Cascade)
+  service    Service           @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([instructorId, serviceId])
+  @@index([serviceId, isActive])
+  @@map("instructor_services")
+}
+
+/// Areas a teacher agrees to travel to, in preference order.
+model InstructorServiceArea {
+  id              String @id @default(uuid()) @db.Uuid
+  instructorId    String @map("instructor_id") @db.Uuid
+  areaId          String @map("area_id") @db.Uuid
+  preferenceOrder Int    @default(0) @map("preference_order")
+
+  instructor InstructorProfile @relation(fields: [instructorId], references: [id], onDelete: Cascade)
+  area       ServiceArea       @relation(fields: [areaId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([instructorId, areaId])
+  @@index([areaId])
+  @@map("instructor_service_areas")
+}
+
+model Package {
+  id                     String  @id @default(uuid()) @db.Uuid
+  serviceId              String  @map("service_id") @db.Uuid
+  name                   String  @db.VarChar(160)
+  sessionCount           Int     @map("session_count")
+  validityDays           Int     @map("validity_days")
+  price                  Decimal @db.Decimal(10, 2)
+  /// 0 = Sunday to 6 = Saturday. Empty means any weekday.
+  allowedWeekdays        Int[]   @map("allowed_weekdays")
+  fixedInstructorAllowed Boolean @default(true) @map("fixed_instructor_allowed")
+  isActive               Boolean @default(true) @map("is_active")
+
+  service  Service   @relation(fields: [serviceId], references: [id], onDelete: Restrict)
+  bookings Booking[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([serviceId, isActive])
+  @@map("packages")
+}
+
+model Addon {
+  id                   String   @id @default(uuid()) @db.Uuid
+  name                 String   @db.VarChar(160)
+  description          String?  @db.Text
+  price                Decimal  @db.Decimal(10, 2)
+  /// Empty means the add-on applies to every service.
+  applicableServiceIds String[] @map("applicable_service_ids") @db.Uuid
+  isActive             Boolean  @default(true) @map("is_active")
+
+  bookingAddons BookingAddon[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@map("addons")
+}
+
+// ---------------------------------------------------------------------------
+// Availability and scheduling
+// ---------------------------------------------------------------------------
+
+/// Weekly template per weekday, with multiple bands allowed per day.
+model AvailabilityRule {
+  id            String    @id @default(uuid()) @db.Uuid
+  instructorId  String    @map("instructor_id") @db.Uuid
+  /// 0 = Sunday to 6 = Saturday.
+  weekday       Int
+  /// Minutes from midnight. Integer arithmetic beats time zones for slot maths.
+  startMinute   Int       @map("start_minute")
+  endMinute     Int       @map("end_minute")
+  effectiveFrom DateTime  @map("effective_from") @db.Date
+  effectiveTo   DateTime? @map("effective_to") @db.Date
+  isActive      Boolean   @default(true) @map("is_active")
+
+  instructor InstructorProfile @relation(fields: [instructorId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([instructorId, weekday, isActive])
+  @@map("availability_rules")
+}
+
+/// A date-specific exception: either extra availability or a block.
+model AvailabilityOverride {
+  id           String   @id @default(uuid()) @db.Uuid
+  instructorId String   @map("instructor_id") @db.Uuid
+  date         DateTime @db.Date
+  startMinute  Int?     @map("start_minute")
+  endMinute    Int?     @map("end_minute")
+  isBlocked    Boolean  @default(false) @map("is_blocked")
+  reason       String?  @db.Text
+
+  instructor InstructorProfile @relation(fields: [instructorId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([instructorId, date])
+  @@map("availability_overrides")
+}
+
+model Leave {
+  id                   String      @id @default(uuid()) @db.Uuid
+  instructorId         String      @map("instructor_id") @db.Uuid
+  fromDate             DateTime    @map("from_date") @db.Date
+  toDate               DateTime    @map("to_date") @db.Date
+  reason               String?     @db.Text
+  status               LeaveStatus @default(PENDING)
+  approvedById         String?     @map("approved_by_id") @db.Uuid
+  decidedAt            DateTime?   @map("decided_at")
+  decisionNote         String?     @map("decision_note") @db.Text
+  affectedSessionCount Int         @default(0) @map("affected_session_count")
+
+  instructor InstructorProfile @relation(fields: [instructorId], references: [id], onDelete: Cascade)
+  approvedBy AdminUser?        @relation(fields: [approvedById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([instructorId, status])
+  @@index([fromDate, toDate])
+  @@map("leaves")
+}
+
+/// Institute holidays. A null cityId means every city.
+model Holiday {
+  id            String   @id @default(uuid()) @db.Uuid
+  date          DateTime @db.Date
+  cityId        String?  @map("city_id") @db.Uuid
+  title         String   @db.VarChar(160)
+  blocksBooking Boolean  @default(true) @map("blocks_booking")
+
+  city City? @relation(fields: [cityId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([date, cityId])
+  @@index([date])
+  @@map("holidays")
+}
+
+// ---------------------------------------------------------------------------
+// Bookings and sessions
+// ---------------------------------------------------------------------------
+
+/// The customer order. A single session produces one BookingSession; a
+/// package produces one per occurrence. Money fields are the agreed totals at
+/// the time of booking and are never recomputed afterwards.
+model Booking {
+  id            String        @id @default(uuid()) @db.Uuid
+  /// Human-readable reference quoted in support and on the invoice.
+  code          String        @unique @db.VarChar(20)
+  customerId    String        @map("customer_id") @db.Uuid
+  serviceId     String        @map("service_id") @db.Uuid
+  packageId     String?       @map("package_id") @db.Uuid
+  addressId     String        @map("address_id") @db.Uuid
+  type          BookingType   @default(SINGLE)
+  sessionCount  Int           @default(1) @map("session_count")
+  grossAmount   Decimal       @map("gross_amount") @db.Decimal(10, 2)
+  discount      Decimal       @default(0) @db.Decimal(10, 2)
+  travelCharge  Decimal       @default(0) @map("travel_charge") @db.Decimal(10, 2)
+  addonAmount   Decimal       @default(0) @map("addon_amount") @db.Decimal(10, 2)
+  tax           Decimal       @default(0) @db.Decimal(10, 2)
+  walletApplied Decimal       @default(0) @map("wallet_applied") @db.Decimal(10, 2)
+  payable       Decimal       @db.Decimal(10, 2)
+  paymentStatus PaymentStatus @default(UNPAID) @map("payment_status")
+  source        BookingSource @default(APP_CUSTOMER)
+  /// Gender, language, "same teacher for all sessions" and similar requests.
+  preferences   Json?
+  /// Set while payment is pending; the expiry job releases the held slots.
+  holdExpiresAt DateTime?     @map("hold_expires_at")
+  createdById   String?       @map("created_by_id") @db.Uuid
+  cancelReason  String?       @map("cancel_reason") @db.Text
+
+  customer CustomerProfile @relation(fields: [customerId], references: [id], onDelete: Restrict)
+  service  Service         @relation(fields: [serviceId], references: [id], onDelete: Restrict)
+  package  Package?        @relation(fields: [packageId], references: [id], onDelete: SetNull)
+  address  Address         @relation(fields: [addressId], references: [id], onDelete: Restrict)
+
+  sessions      BookingSession[]
+  addons        BookingAddon[]
+  statusHistory BookingStatusHistory[]
+  payments      Payment[]
+  invoices      Invoice[]
+  refunds       Refund[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([customerId])
+  @@index([paymentStatus])
+  @@index([holdExpiresAt])
+  @@map("bookings")
+}
+
+model BookingAddon {
+  id        String  @id @default(uuid()) @db.Uuid
+  bookingId String  @map("booking_id") @db.Uuid
+  addonId   String  @map("addon_id") @db.Uuid
+  quantity  Int     @default(1)
+  unitPrice Decimal @map("unit_price") @db.Decimal(10, 2)
+
+  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  addon   Addon   @relation(fields: [addonId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@unique([bookingId, addonId])
+  @@map("booking_addons")
+}
+
+/// One scheduled visit. fromMinute/toMinute are minutes from midnight on
+/// sessionDate; the clash check compares these plus the travel buffer.
+model BookingSession {
+  id                String        @id @default(uuid()) @db.Uuid
+  bookingId         String        @map("booking_id") @db.Uuid
+  sequence          Int           @default(1)
+  serviceId         String        @map("service_id") @db.Uuid
+  sessionDate       DateTime      @map("session_date") @db.Date
+  fromMinute        Int           @map("from_minute")
+  toMinute          Int           @map("to_minute")
+  durationMin       Int           @map("duration_min")
+  addressId         String        @map("address_id") @db.Uuid
+  instructorId      String?       @map("instructor_id") @db.Uuid
+  status            SessionStatus @default(PENDING_PAYMENT)
+  rescheduleCount   Int           @default(0) @map("reschedule_count")
+  /// This session share of the booking total: the base for the earning row.
+  sessionValue      Decimal       @map("session_value") @db.Decimal(10, 2)
+  /// 4-digit code the customer shows the teacher at the door (spec 3.4).
+  checkInOtp        String?       @map("check_in_otp") @db.VarChar(10)
+  cancelReason      String?       @map("cancel_reason") @db.Text
+  notesByInstructor String?       @map("notes_by_instructor") @db.Text
+  completedAt       DateTime?     @map("completed_at")
+
+  booking    Booking            @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  service    Service            @relation(fields: [serviceId], references: [id], onDelete: Restrict)
+  address    Address            @relation(fields: [addressId], references: [id], onDelete: Restrict)
+  instructor InstructorProfile? @relation(fields: [instructorId], references: [id], onDelete: SetNull)
+
+  assignments        Assignment[]
+  checkIn            CheckIn?
+  statusHistory      BookingStatusHistory[]
+  rescheduleRequests RescheduleRequest[]
+  earning            Earning?
+  refunds            Refund[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([bookingId, sequence])
+  // The assignment queue and the day board both filter on these.
+  @@index([sessionDate, status])
+  @@index([instructorId, sessionDate])
+  @@index([status])
+  @@map("booking_sessions")
+}
+
+/// One row per offer made. The accepted row is the live assignment; the rest
+/// are the cascade history and feed the acceptance-rate metric.
+model Assignment {
+  id            String             @id @default(uuid()) @db.Uuid
+  sessionId     String             @map("session_id") @db.Uuid
+  instructorId  String             @map("instructor_id") @db.Uuid
+  mode          AssignmentMode     @default(AUTO)
+  offeredAt     DateTime           @default(now()) @map("offered_at")
+  expiresAt     DateTime?          @map("expires_at")
+  respondedAt   DateTime?          @map("responded_at")
+  response      AssignmentResponse @default(PENDING)
+  declineReason String?            @map("decline_reason") @db.Text
+  /// The matching score and its components at offer time, kept for audit.
+  scoreSnapshot Json?              @map("score_snapshot")
+  assignedById  String?            @map("assigned_by_id") @db.Uuid
+
+  session    BookingSession    @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  instructor InstructorProfile @relation(fields: [instructorId], references: [id], onDelete: Cascade)
+  assignedBy AdminUser?        @relation(fields: [assignedById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([sessionId, response])
+  @@index([instructorId, response])
+  @@index([expiresAt])
+  @@map("assignments")
+}
+
+/// OTP/QR check-in and check-out with the geo-fence result (spec 3.4).
+model CheckIn {
+  id                String    @id @default(uuid()) @db.Uuid
+  sessionId         String    @unique @map("session_id") @db.Uuid
+  instructorId      String    @map("instructor_id") @db.Uuid
+  checkInAt         DateTime  @map("check_in_at")
+  checkInLat        Decimal?  @map("check_in_lat") @db.Decimal(10, 7)
+  checkInLng        Decimal?  @map("check_in_lng") @db.Decimal(10, 7)
+  /// False when the teacher was outside the geo-fence; requires a reason and
+  /// is flagged to operations.
+  geoVerified       Boolean   @default(false) @map("geo_verified")
+  otpUsed           Boolean   @default(true) @map("otp_used")
+  checkOutAt        DateTime? @map("check_out_at")
+  actualDurationMin Int?      @map("actual_duration_min")
+  lateMinutes       Int       @default(0) @map("late_minutes")
+  overrideReason    String?   @map("override_reason") @db.Text
+
+  session    BookingSession    @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  instructor InstructorProfile @relation(fields: [instructorId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([instructorId, checkInAt])
+  @@map("check_ins")
+}
+
+/// Append-only audit trail of every status transition (spec 3.2). Support and
+/// finance rely on this, so nothing in the application may update or delete it.
+model BookingStatusHistory {
+  id         String         @id @default(uuid()) @db.Uuid
+  bookingId  String?        @map("booking_id") @db.Uuid
+  sessionId  String?        @map("session_id") @db.Uuid
+  fromStatus SessionStatus? @map("from_status")
+  toStatus   SessionStatus  @map("to_status")
+  actorType  ActorType      @map("actor_type")
+  actorId    String?        @map("actor_id") @db.Uuid
+  reason     String?        @db.Text
+  remark     String?        @db.Text
+
+  booking Booking?        @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  session BookingSession? @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([bookingId])
+  @@index([sessionId])
+  @@index([createdAt])
+  @@map("booking_status_history")
+}
+
+model RescheduleRequest {
+  id            String           @id @default(uuid()) @db.Uuid
+  sessionId     String           @map("session_id") @db.Uuid
+  requestedBy   ActorType        @map("requested_by")
+  requestedById String?          @map("requested_by_id") @db.Uuid
+  oldDate       DateTime         @map("old_date") @db.Date
+  oldFromMinute Int              @map("old_from_minute")
+  oldToMinute   Int              @map("old_to_minute")
+  newDate       DateTime         @map("new_date") @db.Date
+  newFromMinute Int              @map("new_from_minute")
+  newToMinute   Int              @map("new_to_minute")
+  reason        String?          @db.Text
+  status        RescheduleStatus @default(PENDING)
+  decidedById   String?          @map("decided_by_id") @db.Uuid
+  decidedAt     DateTime?        @map("decided_at")
+  /// Charge applied when the policy makes this reschedule chargeable.
+  chargeApplied Decimal          @default(0) @map("charge_applied") @db.Decimal(10, 2)
+
+  session BookingSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([sessionId, status])
+  @@map("reschedule_requests")
+}
+
+/// Key-value configuration so the slabs, windows and weights the spec calls
+/// admin-configurable are never hard-coded (spec 3.3, 3.5).
+model AppSetting {
+  id          String  @id @default(uuid()) @db.Uuid
+  key         String  @unique @db.VarChar(120)
+  value       Json
+  description String? @db.Text
+  group       String? @db.VarChar(80)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([group])
+  @@map("app_settings")
+}
+
+// ===========================================================================
+// PHASE 3 — money: payments, invoices, wallet, refunds, commission, payouts
+// (spec 7.5, 3.7)
+// ===========================================================================
+
+enum PaymentGateway {
+  RAZORPAY
+  WALLET
+  CASH
+  MANUAL
+}
+
+enum PaymentState {
+  CREATED
+  AUTHORIZED
+  CAPTURED
+  FAILED
+  REFUNDED
+}
+
+enum WalletDirection {
+  CREDIT
+  DEBIT
+}
+
+enum WalletSource {
+  REFUND
+  GOODWILL
+  CASHBACK
+  REFERRAL
+  BOOKING_PAYMENT
+  ADMIN_ADJUSTMENT
+}
+
+enum RefundMode {
+  WALLET
+  SOURCE
+}
+
+enum RefundState {
+  PENDING
+  APPROVED
+  PROCESSING
+  COMPLETED
+  REJECTED
+  FAILED
+}
+
+enum CommissionScope {
+  GLOBAL
+  CATEGORY
+  SERVICE
+  INSTRUCTOR
+}
+
+enum CommissionType {
+  PERCENT
+  FLAT
+}
+
+/// Earning lifecycle (spec 3.7): pending until the dispute window closes,
+/// then payable, then paid once a payout batch settles.
+enum EarningStatus {
+  PENDING
+  PAYABLE
+  PAID
+  WITHHELD
+}
+
+enum PayoutStatus {
+  DRAFT
+  APPROVED
+  INITIATED
+  PROCESSING
+  PAID
+  FAILED
+}
+
+model Payment {
+  id               String         @id @default(uuid()) @db.Uuid
+  bookingId        String         @map("booking_id") @db.Uuid
+  gateway          PaymentGateway @default(RAZORPAY)
+  gatewayOrderId   String?        @unique @map("gateway_order_id") @db.VarChar(120)
+  gatewayPaymentId String?        @unique @map("gateway_payment_id") @db.VarChar(120)
+  amount           Decimal        @db.Decimal(10, 2)
+  method           String?        @db.VarChar(60)
+  status           PaymentState   @default(CREATED)
+  paidAt           DateTime?      @map("paid_at")
+  failureReason    String?        @map("failure_reason") @db.Text
+  /// Full gateway response, kept verbatim for reconciliation and disputes.
+  rawPayload       Json?          @map("raw_payload")
+  /// Supplied by the client so a retried verify cannot double-capture.
+  idempotencyKey   String?        @unique @map("idempotency_key") @db.VarChar(120)
+
+  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([bookingId])
+  @@index([status])
+  @@map("payments")
+}
+
+model Invoice {
+  id           String   @id @default(uuid()) @db.Uuid
+  bookingId    String   @map("booking_id") @db.Uuid
+  invoiceNo    String   @unique @map("invoice_no") @db.VarChar(40)
+  taxableValue Decimal  @map("taxable_value") @db.Decimal(10, 2)
+  /// CGST/SGST/IGST lines, kept as JSON because the split varies by state.
+  taxBreakup   Json?    @map("tax_breakup")
+  total        Decimal  @db.Decimal(10, 2)
+  pdfUrl       String?  @map("pdf_url") @db.Text
+  issuedAt     DateTime @default(now()) @map("issued_at")
+
+  booking Booking @relation(fields: [bookingId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([bookingId])
+  @@map("invoices")
+}
+
+model WalletAccount {
+  id         String  @id @default(uuid()) @db.Uuid
+  customerId String  @unique @map("customer_id") @db.Uuid
+  balance    Decimal @default(0) @db.Decimal(10, 2)
+
+  customer     CustomerProfile     @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  transactions WalletTransaction[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@map("wallet_accounts")
+}
+
+/// Append-only ledger. `runningBalance` is written inside the same transaction
+/// as the balance update, so the ledger can always be reconciled against the
+/// account.
+model WalletTransaction {
+  id             String          @id @default(uuid()) @db.Uuid
+  accountId      String          @map("account_id") @db.Uuid
+  direction      WalletDirection
+  amount         Decimal         @db.Decimal(10, 2)
+  source         WalletSource
+  referenceType  String?         @map("reference_type") @db.VarChar(60)
+  referenceId    String?         @map("reference_id") @db.Uuid
+  runningBalance Decimal         @map("running_balance") @db.Decimal(10, 2)
+  reason         String?         @db.Text
+  createdById    String?         @map("created_by_id") @db.Uuid
+
+  account WalletAccount @relation(fields: [accountId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([accountId, createdAt])
+  @@map("wallet_transactions")
+}
+
+model Refund {
+  id              String      @id @default(uuid()) @db.Uuid
+  bookingId       String      @map("booking_id") @db.Uuid
+  sessionId       String?     @map("session_id") @db.Uuid
+  /// Which policy slab produced this amount, e.g. "MORE_THAN_24H" (spec 3.5).
+  slabApplied     String?     @map("slab_applied") @db.VarChar(60)
+  amount          Decimal     @db.Decimal(10, 2)
+  mode            RefundMode  @default(WALLET)
+  status          RefundState @default(PENDING)
+  gatewayRefundId String?     @map("gateway_refund_id") @db.VarChar(120)
+  approvedById    String?     @map("approved_by_id") @db.Uuid
+  /// Required when an admin overrides the computed slab amount.
+  overrideReason  String?     @map("override_reason") @db.Text
+  processedAt     DateTime?   @map("processed_at")
+
+  booking    Booking         @relation(fields: [bookingId], references: [id], onDelete: Restrict)
+  session    BookingSession? @relation(fields: [sessionId], references: [id], onDelete: SetNull)
+  approvedBy AdminUser?      @relation(fields: [approvedById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([bookingId])
+  @@index([status])
+  @@map("refunds")
+}
+
+/// Commission resolution order is instructor, then service, then category,
+/// then global: the first matching rule wins (spec 3.7).
+model CommissionRule {
+  id            String          @id @default(uuid()) @db.Uuid
+  scope         CommissionScope
+  categoryId    String?         @map("category_id") @db.Uuid
+  serviceId     String?         @map("service_id") @db.Uuid
+  instructorId  String?         @map("instructor_id") @db.Uuid
+  type          CommissionType  @default(PERCENT)
+  value         Decimal         @db.Decimal(10, 2)
+  effectiveFrom DateTime        @map("effective_from") @db.Date
+  effectiveTo   DateTime?       @map("effective_to") @db.Date
+  isActive      Boolean         @default(true) @map("is_active")
+  createdById   String?         @map("created_by_id") @db.Uuid
+
+  service    Service?           @relation(fields: [serviceId], references: [id], onDelete: Cascade)
+  instructor InstructorProfile? @relation(fields: [instructorId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@index([scope, isActive])
+  @@index([effectiveFrom])
+  @@map("commission_rules")
+}
+
+/// Created when a session completes. One row per session, so a session can
+/// never be paid twice.
+model Earning {
+  id               String        @id @default(uuid()) @db.Uuid
+  sessionId        String        @unique @map("session_id") @db.Uuid
+  instructorId     String        @map("instructor_id") @db.Uuid
+  sessionValue     Decimal       @map("session_value") @db.Decimal(10, 2)
+  commissionAmount Decimal       @map("commission_amount") @db.Decimal(10, 2)
+  deductions       Decimal       @default(0) @db.Decimal(10, 2)
+  netAmount        Decimal       @map("net_amount") @db.Decimal(10, 2)
+  status           EarningStatus @default(PENDING)
+  /// When the dispute window closes and this becomes payable.
+  payableFrom      DateTime?     @map("payable_from")
+  /// Reason this earning is held back from a payout batch.
+  withheldReason   String?       @map("withheld_reason") @db.Text
+  commissionRuleId String?       @map("commission_rule_id") @db.Uuid
+
+  session    BookingSession    @relation(fields: [sessionId], references: [id], onDelete: Restrict)
+  instructor InstructorProfile @relation(fields: [instructorId], references: [id], onDelete: Restrict)
+  payoutItem PayoutItem?
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([instructorId, status])
+  @@index([status, payableFrom])
+  @@map("earnings")
+}
+
+model Payout {
+  id            String       @id @default(uuid()) @db.Uuid
+  instructorId  String       @map("instructor_id") @db.Uuid
+  cycleFrom     DateTime     @map("cycle_from") @db.Date
+  cycleTo       DateTime     @map("cycle_to") @db.Date
+  gross         Decimal      @db.Decimal(10, 2)
+  tds           Decimal      @default(0) @db.Decimal(10, 2)
+  deductions    Decimal      @default(0) @db.Decimal(10, 2)
+  net           Decimal      @db.Decimal(10, 2)
+  status        PayoutStatus @default(DRAFT)
+  /// Bank reference once the transfer settles.
+  utr           String?      @db.VarChar(80)
+  statementUrl  String?      @map("statement_url") @db.Text
+  approvedById  String?      @map("approved_by_id") @db.Uuid
+  approvedAt    DateTime?    @map("approved_at")
+  paidAt        DateTime?    @map("paid_at")
+  failureReason String?      @map("failure_reason") @db.Text
+
+  instructor InstructorProfile @relation(fields: [instructorId], references: [id], onDelete: Restrict)
+  approvedBy AdminUser?        @relation(fields: [approvedById], references: [id], onDelete: SetNull)
+  items      PayoutItem[]
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([instructorId, cycleFrom, cycleTo])
+  @@index([status])
+  @@map("payouts")
+}
+
+model PayoutItem {
+  id        String  @id @default(uuid()) @db.Uuid
+  payoutId  String  @map("payout_id") @db.Uuid
+  earningId String  @unique @map("earning_id") @db.Uuid
+  amount    Decimal @db.Decimal(10, 2)
+
+  payout  Payout  @relation(fields: [payoutId], references: [id], onDelete: Cascade)
+  earning Earning @relation(fields: [earningId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([payoutId])
+  @@map("payout_items")
+}
+
+/// Gateway settlement lines matched against payments, refunds and payouts.
+model Settlement {
+  id                  String    @id @default(uuid()) @db.Uuid
+  gatewaySettlementId String    @unique @map("gateway_settlement_id") @db.VarChar(120)
+  settledOn           DateTime  @map("settled_on") @db.Date
+  gross               Decimal   @db.Decimal(12, 2)
+  fees                Decimal   @default(0) @db.Decimal(12, 2)
+  tax                 Decimal   @default(0) @db.Decimal(12, 2)
+  net                 Decimal   @db.Decimal(12, 2)
+  matched             Boolean   @default(false)
+  mismatchNote        String?   @map("mismatch_note") @db.Text
+  reconciledAt        DateTime? @map("reconciled_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([settledOn])
+  @@index([matched])
+  @@map("settlements")
+}
+
+/// Inbound gateway webhooks, deduplicated by event id with retry state
+/// (spec 8.1).
+model WebhookEvent {
+  id          String    @id @default(uuid()) @db.Uuid
+  provider    String    @db.VarChar(60)
+  eventId     String    @map("event_id") @db.VarChar(160)
+  eventType   String    @map("event_type") @db.VarChar(120)
+  payload     Json
+  signature   String?   @db.Text
+  processedAt DateTime? @map("processed_at")
+  attempts    Int       @default(0)
+  lastError   String?   @map("last_error") @db.Text
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([provider, eventId])
+  @@index([processedAt])
+  @@map("webhook_events")
 }

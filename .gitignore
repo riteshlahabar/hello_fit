@@ -58,4 +58,10 @@ pids
 # Diagnostic reports (https://nodejs.org/api/report.html)
 report.[0-9]*.[0-9]*.[0-9]*.[0-9]*.json
 
-/generated/prisma
+/src/generated/prisma
+
+# Agent skill docs installed by `prisma init`. Regenerate with
+# `npx prisma skills sync`; skills-lock.json is committed so versions are
+# reproducible.
+.agents/
+.windsurf/

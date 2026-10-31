@@ -81,7 +81,8 @@ export class AllExceptionsFilter implements ExceptionFilter {
       error: { code, message, ...(details === undefined ? {} : { details }) },
       meta: {
         requestId: (request.headers['x-request-id'] as string) ?? null,
-        path: request.url,
+        // originalUrl keeps the global /api prefix; req.url has it stripped.
+        path: request.originalUrl || request.url,
         timestamp: new Date().toISOString(),
       },
     };
