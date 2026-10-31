@@ -1,0 +1,81 @@
+import { plainToInstance } from 'class-transformer';
+import {
+  IsEnum,
+  IsInt,
+  IsNotEmpty,
+  IsString,
+  Max,
+  Min,
+  MinLength,
+  validateSync,
+} from 'class-validator';
+
+export enum NodeEnv {
+  Development = 'development',
+  Test = 'test',
+  Production = 'production',
+}
+
+/**
+ * Shape of the environment this app refuses to boot without. Validated once at
+ * startup so a missing DATABASE_URL or JWT secret fails immediately instead of
+ * surfacing as a confusing 500 on the first request that happens to need it.
+ */
+export class EnvVars {
+  @IsEnum(NodeEnv)
+  NODE_ENV: NodeEnv = NodeEnv.Development;
+
+  @IsInt()
+  @Min(1)
+  @Max(65535)
+  PORT: number = 3000;
+
+  @IsString()
+  @IsNotEmpty()
+  DATABASE_URL!: string;
+
+  @IsString()
+  @MinLength(32, { message: 'JWT_ACCESS_SECRET must be at least 32 characters' })
+  JWT_ACCESS_SECRET!: string;
+
+  @IsString()
+  @IsNotEmpty()
+  JWT_ACCESS_TTL: string = '15m';
+
+  @IsString()
+  @MinLength(32, {
+    message: 'JWT_REFRESH_SECRET must be at least 32 characters',
+  })
+  JWT_REFRESH_SECRET!: string;
+
+  @IsString()
+  @IsNotEmpty()
+  JWT_REFRESH_TTL: string = '30d';
+}
+
+export function validateEnv(raw: Record<string, unknown>): EnvVars {
+  const parsed = plainToInstance(EnvVars, raw, {
+    enableImplicitConversion: true,
+    exposeDefaultValues: true,
+  });
+
+  const errors = validateSync(parsed, { skipMissingProperties: false });
+
+  if (errors.length > 0) {
+    const details = errors
+      .map((e) => `  - ${e.property}: ${Object.values(e.constraints ?? {}).join(', ')}`)
+      .join('\n');
+    throw new Error(`Invalid environment configuration:\n${details}`);
+  }
+
+  if (
+    parsed.NODE_ENV === NodeEnv.Production &&
+    parsed.JWT_ACCESS_SECRET === parsed.JWT_REFRESH_SECRET
+  ) {
+    throw new Error(
+      'JWT_ACCESS_SECRET and JWT_REFRESH_SECRET must differ in production',
+    );
+  }
+
+  return parsed;
+}
