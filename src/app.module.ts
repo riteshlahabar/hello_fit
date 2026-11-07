@@ -12,9 +12,15 @@ import { RequestIdMiddleware } from './common/middleware/request-id.middleware';
 import { validateEnv } from './config/env.validation';
 import { ScheduleModule } from '@nestjs/schedule';
 import { AuthModule } from './modules/auth/auth.module';
+import { AssignmentModule } from './modules/assignment/assignment.module';
 import { AvailabilityModule } from './modules/availability/availability.module';
 import { BookingModule } from './modules/booking/booking.module';
 import { CatalogModule } from './modules/catalog/catalog.module';
+import { CustomerModule } from './modules/customer/customer.module';
+import { PaymentModule } from './modules/payment/payment.module';
+import { ReviewModule } from './modules/review/review.module';
+import { SessionModule } from './modules/session/session.module';
+import { WalletModule } from './modules/wallet/wallet.module';
 import { SettingsModule } from './modules/settings/settings.module';
 import { PrismaModule } from './prisma/prisma.module';
 
@@ -34,9 +40,15 @@ import { PrismaModule } from './prisma/prisma.module';
     PrismaModule,
     SettingsModule,
     AuthModule,
+    CustomerModule,
     CatalogModule,
     AvailabilityModule,
     BookingModule,
+    AssignmentModule,
+    SessionModule,
+    WalletModule,
+    PaymentModule,
+    ReviewModule,
   ],
   controllers: [AppController],
   providers: [

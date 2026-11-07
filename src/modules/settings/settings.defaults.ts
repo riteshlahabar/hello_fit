@@ -94,6 +94,15 @@ export interface ReviewPolicy {
   lowRatingWindowDays: number;
 }
 
+/** Customer account limits. */
+export interface CustomerPolicy {
+  /**
+   * Saved addresses per customer. A cap at all is about abuse and about the
+   * address picker staying usable, not storage.
+   */
+  maxAddresses: number;
+}
+
 export interface HelloFitSettings {
   refundSlabs: RefundSlabs;
   reschedulePolicy: ReschedulePolicy;
@@ -102,6 +111,7 @@ export interface HelloFitSettings {
   payment: PaymentPolicy;
   payout: PayoutPolicy;
   review: ReviewPolicy;
+  customer: CustomerPolicy;
 }
 
 /**
@@ -169,6 +179,9 @@ export const DEFAULT_SETTINGS: HelloFitSettings = {
     autoFlagAtOrBelow: 1,
     lowRatingThreshold: 3,
     lowRatingWindowDays: 30,
+  },
+  customer: {
+    maxAddresses: 10,
   },
 };
 

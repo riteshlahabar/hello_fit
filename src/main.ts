@@ -7,7 +7,12 @@ import { ResponseEnvelopeInterceptor } from './common/interceptors/response-enve
 import type { EnvVars } from './config/env.validation';
 
 async function bootstrap() {
-  const app = await NestFactory.create(AppModule, { bufferLogs: true });
+  const app = await NestFactory.create(AppModule, {
+    bufferLogs: true,
+    // Webhook signatures are computed over the exact bytes received, so the
+    // raw body must survive JSON parsing.
+    rawBody: true,
+  });
   const config = app.get(ConfigService<EnvVars, true>);
 
   // REST under /api/v1 — the spec splits audiences by path below this

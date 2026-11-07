@@ -174,6 +174,7 @@ model CustomerProfile {
   deletedAt     DateTime?      @map("deleted_at")
   bookings      Booking[]
   walletAccount WalletAccount?
+  trustEvents   TrustEvent[]
 
   @@index([trustBand])
   @@index([isBlocked])
@@ -410,13 +411,15 @@ model AdminUser {
   managedBranches   Branch[]       @relation("BranchManager")
   refreshTokens     RefreshToken[]
 
-  createdAt   DateTime     @default(now()) @map("created_at")
-  updatedAt   DateTime     @updatedAt @map("updated_at")
-  deletedAt   DateTime?    @map("deleted_at")
-  leaves      Leave[]
-  assignments Assignment[]
-  refunds     Refund[]
-  payouts     Payout[]
+  createdAt     DateTime       @default(now()) @map("created_at")
+  updatedAt     DateTime       @updatedAt @map("updated_at")
+  deletedAt     DateTime?      @map("deleted_at")
+  leaves        Leave[]
+  assignments   Assignment[]
+  refunds       Refund[]
+  payouts       Payout[]
+  reviews       Review[]
+  reviewReports ReviewReport[]
 
   @@index([roleId])
   @@index([branchId])
@@ -965,6 +968,7 @@ model Booking {
   createdAt DateTime  @default(now()) @map("created_at")
   updatedAt DateTime  @updatedAt @map("updated_at")
   deletedAt DateTime? @map("deleted_at")
+  reviews   Review[]
 
   @@index([customerId])
   @@index([paymentStatus])
@@ -1026,6 +1030,7 @@ model BookingSession {
   createdAt DateTime  @default(now()) @map("created_at")
   updatedAt DateTime  @updatedAt @map("updated_at")
   deletedAt DateTime? @map("deleted_at")
+  reviews   Review[]
 
   @@unique([bookingId, sequence])
   // The assignment queue and the day board both filter on these.
@@ -1487,4 +1492,196 @@ model WebhookEvent {
   @@unique([provider, eventId])
   @@index([processedAt])
   @@map("webhook_events")
+}
+
+// ===========================================================================
+// PHASE 4 — two-way review system, ratings and trust (spec 4, 7.4)
+// ===========================================================================
+
+/// Who wrote a review, and therefore which direction it runs.
+enum ReviewAuthorType {
+  CUSTOMER
+  INSTRUCTOR
+}
+
+/// Review lifecycle (spec 4.4). Double-blind: SUBMITTED stays hidden from the
+/// counter-party until both sides submit or the window closes.
+enum ReviewState {
+  PENDING
+  SUBMITTED
+  PUBLISHED
+  FLAGGED
+  HIDDEN
+  EXPIRED
+}
+
+enum ReviewDirection {
+  CUSTOMER_TO_INSTRUCTOR
+  INSTRUCTOR_TO_CUSTOMER
+}
+
+enum ReviewReportState {
+  OPEN
+  UPHELD
+  REJECTED
+}
+
+enum RatingSubjectType {
+  INSTRUCTOR
+  CUSTOMER
+}
+
+/// One review per session per direction — the unique index enforces it, so a
+/// double submit cannot inflate a rating.
+model Review {
+  id               String            @id @default(uuid()) @db.Uuid
+  sessionId        String            @map("session_id") @db.Uuid
+  bookingId        String            @map("booking_id") @db.Uuid
+  authorType       ReviewAuthorType  @map("author_type")
+  /// CustomerProfile.id or InstructorProfile.id, depending on authorType.
+  authorId         String            @map("author_id") @db.Uuid
+  subjectType      RatingSubjectType @map("subject_type")
+  subjectId        String            @map("subject_id") @db.Uuid
+  direction        ReviewDirection
+  overallRating    Int               @map("overall_rating")
+  comment          String?           @db.Text
+  photos           String[]
+  tags             String[]
+  recommendAgain   Boolean?          @map("recommend_again")
+  /// Teacher-to-customer only, never shown to the customer (spec 4.3).
+  confidentialNote String?           @map("confidential_note") @db.Text
+  state            ReviewState       @default(SUBMITTED)
+  submittedAt      DateTime?         @map("submitted_at")
+  publishedAt      DateTime?         @map("published_at")
+  /// After this the author can no longer edit (spec 4.4, 24 hours).
+  editLockedAt     DateTime?         @map("edit_locked_at")
+  /// Set when auto-flagged, with the trigger recorded for the moderator.
+  flagReason       String?           @map("flag_reason") @db.Text
+  hiddenReason     String?           @map("hidden_reason") @db.Text
+  hiddenById       String?           @map("hidden_by_id") @db.Uuid
+  /// The teacher may reply once to a published customer review (spec 6.3).
+  reply            String?           @db.Text
+  repliedAt        DateTime?         @map("replied_at")
+
+  session  BookingSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+  booking  Booking        @relation(fields: [bookingId], references: [id], onDelete: Cascade)
+  hiddenBy AdminUser?     @relation(fields: [hiddenById], references: [id], onDelete: SetNull)
+
+  criteriaScores ReviewCriteriaScore[]
+  reports        ReviewReport[]
+  trustEvents    TrustEvent[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([sessionId, authorType])
+  @@index([subjectType, subjectId, state])
+  @@index([state])
+  // Drives the publishing job that closes the window.
+  @@index([state, createdAt])
+  @@map("reviews")
+}
+
+/// Admin-configurable criteria per direction (spec 4.5, 7.4).
+model ReviewCriteria {
+  id          String          @id @default(uuid()) @db.Uuid
+  direction   ReviewDirection
+  name        String          @db.VarChar(120)
+  slug        String          @db.VarChar(120)
+  /// Relative weight when computing the criteria average.
+  weight      Decimal         @default(1) @db.Decimal(5, 2)
+  isMandatory Boolean         @default(false) @map("is_mandatory")
+  sortOrder   Int             @default(0) @map("sort_order")
+  isActive    Boolean         @default(true) @map("is_active")
+
+  scores ReviewCriteriaScore[]
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  @@unique([direction, slug])
+  @@index([direction, isActive])
+  @@map("review_criteria")
+}
+
+model ReviewCriteriaScore {
+  id         String @id @default(uuid()) @db.Uuid
+  reviewId   String @map("review_id") @db.Uuid
+  criteriaId String @map("criteria_id") @db.Uuid
+  score      Int
+
+  review   Review         @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+  criteria ReviewCriteria @relation(fields: [criteriaId], references: [id], onDelete: Restrict)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@unique([reviewId, criteriaId])
+  @@map("review_criteria_scores")
+}
+
+/// Either side can report a published review (spec 4.5).
+model ReviewReport {
+  id           String            @id @default(uuid()) @db.Uuid
+  reviewId     String            @map("review_id") @db.Uuid
+  reportedBy   ReviewAuthorType  @map("reported_by")
+  reportedById String            @map("reported_by_id") @db.Uuid
+  reason       String            @db.Text
+  state        ReviewReportState @default(OPEN)
+  decidedById  String?           @map("decided_by_id") @db.Uuid
+  decidedAt    DateTime?         @map("decided_at")
+  decisionNote String?           @map("decision_note") @db.Text
+
+  review    Review     @relation(fields: [reviewId], references: [id], onDelete: Cascade)
+  decidedBy AdminUser? @relation(fields: [decidedById], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@index([state])
+  @@index([reviewId])
+  @@map("review_reports")
+}
+
+/// Denormalised rating totals, recomputed when a review publishes or hides.
+/// Kept as a table rather than computed on read because the teacher list and
+/// the matching score both need it on every request.
+model RatingAggregate {
+  id               String            @id @default(uuid()) @db.Uuid
+  subjectType      RatingSubjectType @map("subject_type")
+  subjectId        String            @map("subject_id") @db.Uuid
+  ratingAvg        Decimal           @default(0) @map("rating_avg") @db.Decimal(3, 2)
+  ratingCount      Int               @default(0) @map("rating_count")
+  /// Average per criterion, keyed by criteria slug.
+  criteriaAverages Json?             @map("criteria_averages")
+  /// Count per star value 1..5, for the ratings histogram.
+  distribution     Json?
+  lastRecalcAt     DateTime?         @map("last_recalc_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  @@unique([subjectType, subjectId])
+  @@map("rating_aggregates")
+}
+
+/// Append-only trail of how a customer's trust score moved (spec 4.6), so a
+/// blocked customer can be shown exactly what produced the decision.
+model TrustEvent {
+  id             String    @id @default(uuid()) @db.Uuid
+  customerId     String    @map("customer_id") @db.Uuid
+  sourceReviewId String?   @map("source_review_id") @db.Uuid
+  delta          Decimal   @db.Decimal(5, 2)
+  reason         String    @db.VarChar(200)
+  resultingScore Decimal   @map("resulting_score") @db.Decimal(5, 2)
+  resultingBand  TrustBand @map("resulting_band")
+
+  customer     CustomerProfile @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  sourceReview Review?         @relation(fields: [sourceReviewId], references: [id], onDelete: SetNull)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([customerId, createdAt])
+  @@map("trust_events")
 }

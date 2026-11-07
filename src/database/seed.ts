@@ -354,6 +354,45 @@ async function seedCommission() {
   );
 }
 
+
+/** Review criteria from spec 4.2 and 4.3. Admin-editable afterwards. */
+const REVIEW_CRITERIA: Array<{
+  direction: 'CUSTOMER_TO_INSTRUCTOR' | 'INSTRUCTOR_TO_CUSTOMER';
+  name: string;
+  slug: string;
+  isMandatory: boolean;
+}> = [
+  // Customer rates the teacher (public).
+  { direction: 'CUSTOMER_TO_INSTRUCTOR', name: 'Punctuality', slug: 'punctuality', isMandatory: true },
+  { direction: 'CUSTOMER_TO_INSTRUCTOR', name: 'Knowledge and technique', slug: 'knowledge', isMandatory: true },
+  { direction: 'CUSTOMER_TO_INSTRUCTOR', name: 'Communication and guidance', slug: 'communication', isMandatory: false },
+  { direction: 'CUSTOMER_TO_INSTRUCTOR', name: 'Professionalism and behaviour', slug: 'professionalism', isMandatory: false },
+  { direction: 'CUSTOMER_TO_INSTRUCTOR', name: 'Hygiene and equipment handling', slug: 'hygiene', isMandatory: false },
+  // Teacher rates the customer (internal only).
+  { direction: 'INSTRUCTOR_TO_CUSTOMER', name: 'Punctuality and readiness', slug: 'readiness', isMandatory: true },
+  { direction: 'INSTRUCTOR_TO_CUSTOMER', name: 'Space suitability', slug: 'space', isMandatory: true },
+  { direction: 'INSTRUCTOR_TO_CUSTOMER', name: 'Cooperation and follow-through', slug: 'cooperation', isMandatory: false },
+  { direction: 'INSTRUCTOR_TO_CUSTOMER', name: 'Behaviour and respect', slug: 'behaviour', isMandatory: false },
+  { direction: 'INSTRUCTOR_TO_CUSTOMER', name: 'Safety and comfort of the environment', slug: 'safety', isMandatory: false },
+];
+
+async function seedReviewCriteria() {
+  let order = 0;
+
+  for (const criteria of REVIEW_CRITERIA) {
+    await prisma.reviewCriteria.upsert({
+      where: {
+        direction_slug: { direction: criteria.direction, slug: criteria.slug },
+      },
+      create: { ...criteria, sortOrder: order },
+      update: { name: criteria.name, isMandatory: criteria.isMandatory },
+    });
+    order += 1;
+  }
+
+  console.log(`  review criteria: ${REVIEW_CRITERIA.length}`);
+}
+
 async function main() {
   console.log('Seeding HelloFit...');
   await seedPermissions();
@@ -364,6 +403,7 @@ async function main() {
   await seedGeography();
   await seedCatalog();
   await seedCommission();
+  await seedReviewCriteria();
   console.log('Done.');
 }
 

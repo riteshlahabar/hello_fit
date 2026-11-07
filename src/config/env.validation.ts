@@ -1,6 +1,7 @@
 import { plainToInstance } from 'class-transformer';
 import {
   IsEnum,
+  IsOptional,
   IsInt,
   IsNotEmpty,
   IsString,
@@ -51,6 +52,20 @@ export class EnvVars {
   @IsString()
   @IsNotEmpty()
   JWT_REFRESH_TTL: string = '30d';
+
+  // Payments. Optional in development: PaymentModule falls back to a
+  // simulated gateway, and refuses to boot in production without these.
+  @IsOptional()
+  @IsString()
+  RAZORPAY_KEY_ID?: string;
+
+  @IsOptional()
+  @IsString()
+  RAZORPAY_KEY_SECRET?: string;
+
+  @IsOptional()
+  @IsString()
+  RAZORPAY_WEBHOOK_SECRET?: string;
 }
 
 export function validateEnv(raw: Record<string, unknown>): EnvVars {

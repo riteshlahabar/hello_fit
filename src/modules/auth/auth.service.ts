@@ -4,7 +4,6 @@ import {
   Logger,
   UnauthorizedException,
 } from '@nestjs/common';
-import { randomBytes } from 'node:crypto';
 import * as bcrypt from 'bcryptjs';
 import { PrismaService } from '../../prisma/prisma.service';
 import { ErrorCode } from '../../common/errors/error-codes';
@@ -21,6 +20,7 @@ import type {
   VerifyOtpDto,
 } from './dto/auth.dto';
 import { UserStatus, type UserRole } from '../../generated/prisma/enums';
+import { generateReferralCode } from '../customer/referral';
 
 /** What the app needs to decide which shell to load (spec 6.1). */
 export interface AppSession extends TokenPair {
@@ -331,9 +331,17 @@ export class AuthService {
   }
 
   /** Retries on the (vanishingly unlikely) unique-code collision. */
+  /**
+   * Allocates a referral code for a brand-new customer.
+   *
+   * The alphabet lives in `modules/customer/referral.ts` — codes get read aloud
+   * and typed back in, so it excludes 0/O and 1/I/L. This used to build one
+   * from `randomBytes(4).toString('hex')`, which could produce exactly those
+   * characters; old codes stay valid on input, but new ones are unambiguous.
+   */
   private async generateReferralCode(): Promise<string> {
     for (let attempt = 0; attempt < 5; attempt += 1) {
-      const code = `HF${randomBytes(4).toString('hex').toUpperCase()}`;
+      const code = generateReferralCode();
       const taken = await this.prisma.customerProfile.findUnique({
         where: { referralCode: code },
         select: { id: true },

@@ -24,6 +24,13 @@ export const ErrorCode = {
   // Data
   DUPLICATE_RESOURCE: 'DUPLICATE_RESOURCE',
   FOREIGN_KEY_VIOLATION: 'FOREIGN_KEY_VIOLATION',
+
+  // Profile and addresses
+  PROFILE_EXISTS: 'PROFILE_EXISTS',
+  PROFILE_REQUIRED: 'PROFILE_REQUIRED',
+  ADDRESS_LIMIT_REACHED: 'ADDRESS_LIMIT_REACHED',
+  /** An upcoming session is still scheduled at this address. */
+  ADDRESS_IN_USE: 'ADDRESS_IN_USE',
 } as const;
 
 export type ErrorCodeValue = (typeof ErrorCode)[keyof typeof ErrorCode];

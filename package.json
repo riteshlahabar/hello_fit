@@ -1,5 +1,5 @@
 {
-  "name": "health_fit_backend",
+  "name": "hello_fit_backend",
   "version": "0.0.1",
   "description": "",
   "author": "",
@@ -22,7 +22,8 @@
     "db:seed": "nest build && node dist/database/seed.js",
     "db:migrate": "prisma migrate dev",
     "db:generate": "prisma generate",
-    "db:studio": "prisma studio"
+    "db:studio": "prisma studio",
+    "smoke:customer": "node test/smoke-customer.mjs"
   },
   "dependencies": {
     "@nestjs/common": "^12.0.1",

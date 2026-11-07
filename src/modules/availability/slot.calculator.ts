@@ -187,16 +187,18 @@ function startMinuteCutoff(
   now: Date,
   policy: SchedulingPolicy,
 ): number {
-  const dayStart = new Date(
-    date.getFullYear(),
-    date.getMonth(),
-    date.getDate(),
-  ).getTime();
-  const nowDayStart = new Date(
+  // Compared as calendar days: the searched date arrives as UTC midnight
+  // from a date column, while "now" is an instant in local time.
+  const dayStart = Date.UTC(
+    date.getUTCFullYear(),
+    date.getUTCMonth(),
+    date.getUTCDate(),
+  );
+  const nowDayStart = Date.UTC(
     now.getFullYear(),
     now.getMonth(),
     now.getDate(),
-  ).getTime();
+  );
 
   if (dayStart > nowDayStart) return Number.NEGATIVE_INFINITY;
   if (dayStart < nowDayStart) return Number.POSITIVE_INFINITY;

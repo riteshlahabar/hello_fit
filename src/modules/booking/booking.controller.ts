@@ -13,6 +13,7 @@ import { BookingService } from './booking.service';
 import { AvailabilityService } from '../availability/availability.service';
 import { PrismaService } from '../../prisma/prisma.service';
 import { ErrorCode } from '../../common/errors/error-codes';
+import { parseCalendarDate } from '../../common/dates/calendar';
 import {
   AllowAudience,
   CurrentUser,
@@ -129,15 +130,13 @@ export class BookingController {
   }
 
   private parseDate(value: string): Date {
-    const parsed = new Date(value);
-
-    if (Number.isNaN(parsed.getTime())) {
+    try {
+      return parseCalendarDate(value);
+    } catch {
       throw new BadRequestException({
         code: ErrorCode.VALIDATION_FAILED,
-        message: 'date must be a valid ISO date',
+        message: 'date must be a valid ISO date (YYYY-MM-DD)',
       });
     }
-
-    return parsed;
   }
 }

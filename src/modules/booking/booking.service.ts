@@ -10,10 +10,14 @@ import { PrismaService } from '../../prisma/prisma.service';
 import type { Prisma } from '../../generated/prisma/client';
 import { SettingsService } from '../settings/settings.service';
 import { ErrorCode } from '../../common/errors/error-codes';
+import { AssignmentService } from '../assignment/assignment.service';
+import { AvailabilityService } from '../availability/availability.service';
 import {
-  AvailabilityService,
-  startOfDay,
-} from '../availability/availability.service';
+  addCalendarDays,
+  calendarWeekday,
+  parseCalendarDate,
+  todayCalendar,
+} from '../../common/dates/calendar';
 import {
   quote as computeQuote,
   splitSessionValues,
@@ -30,6 +34,7 @@ export class BookingService {
     private readonly prisma: PrismaService,
     private readonly settings: SettingsService,
     private readonly availability: AvailabilityService,
+    private readonly assignment: AssignmentService,
   ) {}
 
   /**
@@ -255,12 +260,87 @@ export class BookingService {
     };
   }
 
+  /**
+   * Marks a booking paid and releases its sessions into the assignment
+   * queue. The payments module will call this from the verified Razorpay
+   * webhook; until then it is reachable from the admin panel, which is also
+   * how a cash or manual payment is recorded.
+   */
+  async confirmPayment(bookingId: string, actorId: string, actorType: 'ADMIN' | 'SYSTEM') {
+    const booking = await this.prisma.booking.findFirst({
+      where: { id: bookingId, deletedAt: null },
+      include: { sessions: { where: { status: 'PENDING_PAYMENT' } } },
+    });
+
+    if (!booking) {
+      throw new NotFoundException({
+        code: ErrorCode.NOT_FOUND,
+        message: 'Booking not found',
+      });
+    }
+
+    if (booking.paymentStatus === 'PAID') {
+      throw new BadRequestException({
+        code: ErrorCode.DUPLICATE_RESOURCE,
+        message: 'This booking is already paid',
+      });
+    }
+
+    await this.prisma.$transaction(async (tx) => {
+      await tx.booking.update({
+        where: { id: bookingId },
+        data: { paymentStatus: 'PAID', holdExpiresAt: null },
+      });
+
+      await tx.bookingSession.updateMany({
+        where: { bookingId, status: 'PENDING_PAYMENT' },
+        data: { status: 'CONFIRMED' },
+      });
+
+      await tx.bookingStatusHistory.createMany({
+        data: booking.sessions.map((session) => ({
+          bookingId,
+          sessionId: session.id,
+          fromStatus: 'PENDING_PAYMENT' as const,
+          toStatus: 'CONFIRMED' as const,
+          actorType,
+          actorId: actorType === 'ADMIN' ? actorId : null,
+          reason: 'Payment confirmed',
+        })),
+      });
+    });
+
+    // Offer each session to its best match. Failures are logged rather than
+    // thrown: the money is taken and the booking is valid, so an unassigned
+    // session belongs in the admin queue, not in a failed HTTP response.
+    const offers = [];
+    for (const session of booking.sessions) {
+      const offer = await this.assignment
+        .offerNextCandidate(session.id)
+        .catch((error: unknown) => {
+          this.logger.error(
+            `Auto-assign failed for session ${session.id}`,
+            error instanceof Error ? error.stack : String(error),
+          );
+          return null;
+        });
+
+      offers.push({ sessionId: session.id, offered: Boolean(offer) });
+    }
+
+    this.logger.log(
+      `Booking ${booking.code} confirmed: ${offers.filter((o) => o.offered).length}/${offers.length} session(s) offered`,
+    );
+
+    return { bookingId, paymentStatus: 'PAID' as const, offers };
+  }
+
   /** Customer's own bookings, newest first. */
   async listForCustomer(
     customerId: string,
     filter: { status?: 'upcoming' | 'completed' | 'cancelled' },
   ) {
-    const today = startOfDay(new Date());
+    const today = todayCalendar();
 
     const statusFilter = (() => {
       switch (filter.status) {
@@ -439,7 +519,8 @@ export class BookingService {
     durationMin: number,
   ): Array<{ date: Date; fromMinute: number; toMinute: number }> {
     const toMinute = dto.toMinute ?? dto.fromMinute + durationMin;
-    const first = startOfDay(new Date(dto.sessionDate));
+    // Parsed as a calendar day so a client in any timezone gets the day it asked for.
+    const first = parseCalendarDate(dto.sessionDate);
 
     if (!pkg) {
       return [{ date: first, fromMinute: dto.fromMinute, toMinute }];
@@ -450,7 +531,7 @@ export class BookingService {
         ? dto.weekdays
         : pkg.allowedWeekdays.length > 0
           ? pkg.allowedWeekdays
-          : [first.getDay()];
+          : [calendarWeekday(first)];
 
     // A package restricted to certain weekdays cannot be booked on others.
     if (
@@ -468,7 +549,7 @@ export class BookingService {
       fromMinute: number;
       toMinute: number;
     }> = [];
-    const cursor = new Date(first);
+    let cursor = first;
 
     // Walk forward day by day, taking matching weekdays until the package is
     // filled. Bounded so a bad weekday list cannot loop forever.
@@ -477,14 +558,10 @@ export class BookingService {
       occurrences.length < pkg.sessionCount && guard < 400;
       guard += 1
     ) {
-      if (weekdays.includes(cursor.getDay())) {
-        occurrences.push({
-          date: startOfDay(cursor),
-          fromMinute: dto.fromMinute,
-          toMinute,
-        });
+      if (weekdays.includes(calendarWeekday(cursor))) {
+        occurrences.push({ date: cursor, fromMinute: dto.fromMinute, toMinute });
       }
-      cursor.setDate(cursor.getDate() + 1);
+      cursor = addCalendarDays(cursor, 1);
     }
 
     return occurrences;

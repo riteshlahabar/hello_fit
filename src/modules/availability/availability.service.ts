@@ -3,6 +3,12 @@ import { PrismaService } from '../../prisma/prisma.service';
 import { SettingsService } from '../settings/settings.service';
 import { ErrorCode } from '../../common/errors/error-codes';
 import {
+  calendarDayOf,
+  calendarDaysBetween,
+  calendarWeekday,
+  todayCalendar,
+} from '../../common/dates/calendar';
+import {
   computeSlots,
   formatMinute,
   mergeBands,
@@ -83,8 +89,10 @@ export class AvailabilityService {
 
     this.assertBookableDate(params.date, scheduling.maxAdvanceDays);
 
-    const weekday = params.date.getDay();
-    const dayStart = startOfDay(params.date);
+    // Calendar day, not an instant: the date column stores UTC midnight,
+    // so the weekday must be read in the same terms.
+    const dayStart = calendarDayOf(params.date);
+    const weekday = calendarWeekday(dayStart);
 
     // A holiday that blocks booking closes the whole day for that city.
     const holiday = await this.prisma.holiday.findFirst({
@@ -215,7 +223,7 @@ export class AvailabilityService {
     excludeSessionId?: string;
   }): Promise<boolean> {
     const scheduling = this.settings.get('scheduling');
-    const dayStart = startOfDay(params.date);
+    const dayStart = calendarDayOf(params.date);
 
     const instructor = await this.prisma.instructorProfile.findFirst({
       where: { id: params.instructorId, deletedAt: null, status: 'ACTIVE' },
@@ -285,9 +293,7 @@ export class AvailabilityService {
   }
 
   private assertBookableDate(date: Date, maxAdvanceDays: number): void {
-    const today = startOfDay(new Date());
-    const target = startOfDay(date);
-    const daysAhead = (target.getTime() - today.getTime()) / 86_400_000;
+    const daysAhead = calendarDaysBetween(todayCalendar(), date);
 
     if (daysAhead < 0) {
       throw new BadRequestException({
@@ -305,5 +311,5 @@ export class AvailabilityService {
   }
 }
 
-export const startOfDay = (date: Date): Date =>
-  new Date(date.getFullYear(), date.getMonth(), date.getDate());
+/** @deprecated Use the helpers in common/dates/calendar instead. */
+export { calendarDayOf as startOfDay } from '../../common/dates/calendar';
